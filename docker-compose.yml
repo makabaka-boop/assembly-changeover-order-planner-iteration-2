@@ -1,0 +1,14 @@
+services:
+  api:
+    build: .
+    image: changeover-scheduler:latest
+    container_name: changeover-scheduler-api
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
