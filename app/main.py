@@ -29,4 +29,9 @@ def schedule(request: ScheduleRequest) -> dict:
     jobs = [Job(id=j.id, family=j.family) for j in request.jobs]
     edges = [(e.before, e.after) for e in request.edges]
     immediate = [(p.before, p.after) for p in request.immediate]
-    return solve(jobs, edges, immediate)
+    return solve(
+        jobs,
+        edges,
+        immediate,
+        max_same_family_run=request.max_same_family_run,
+    )

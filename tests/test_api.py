@@ -377,3 +377,153 @@ def test_immediate_pair_does_not_share_duplicate_rule_with_edges() -> None:
     resp = post(body)
     assert resp.status_code == 200
     assert resp.json()["order"] == ["a", "b"]
+
+
+# --------------------------------------------------------------------------
+# same-family run cap
+# --------------------------------------------------------------------------
+
+
+def test_run_cap_defaults_to_disabled() -> None:
+    body = {
+        "jobs": [
+            {"id": "a", "family": "X"},
+            {"id": "b", "family": "X"},
+        ],
+    }
+    data = post(body).json()
+    assert data["order"] == ["a", "b"]
+    assert "family_runs" not in data
+
+
+def test_run_cap_explicit_null_matches_omitted() -> None:
+    base = {
+        "jobs": [
+            {"id": "a", "family": "X"},
+            {"id": "b", "family": "Y"},
+        ],
+        "edges": [{"before": "a", "after": "b"}],
+    }
+    assert post(base).json() == post({**base, "max_same_family_run": None}).json()
+
+
+def test_run_cap_success_payload() -> None:
+    body = {
+        "jobs": [
+            {"id": "a", "family": "X"},
+            {"id": "b", "family": "X"},
+            {"id": "c", "family": "Y"},
+            {"id": "d", "family": "X"},
+        ],
+        "max_same_family_run": 2,
+    }
+    data = post(body).json()
+    assert data["status"] == "OK"
+    assert data["order"] == ["a", "b", "c", "d"]
+    assert data["family_runs"] == [
+        {"family": "X", "start": 1, "end": 2, "length": 2, "jobs": ["a", "b"]},
+        {"family": "Y", "start": 3, "end": 3, "length": 1, "jobs": ["c"]},
+        {"family": "X", "start": 4, "end": 4, "length": 1, "jobs": ["d"]},
+    ]
+    # Every other payload field stays exactly where it was historically.
+    assert data["changeover_count"] == 2
+    assert data["changeover_positions"] == [3, 4]
+
+
+def test_run_cap_unschedulable_has_no_partial_schedule() -> None:
+    body = {
+        "jobs": [
+            {"id": "a", "family": "X"},
+            {"id": "b", "family": "X"},
+        ],
+        "max_same_family_run": 1,
+    }
+    resp = post(body)
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "UNSCHEDULABLE"}
+
+
+def test_run_cap_in_chain_is_unschedulable_not_422() -> None:
+    # A valid request whose fixed chain intrinsically violates the cap is a
+    # scheduling impossibility, not a malformed request.
+    body = {
+        "jobs": [
+            {"id": "a", "family": "X"},
+            {"id": "b", "family": "X"},
+            {"id": "c", "family": "X"},
+        ],
+        "immediate": [
+            {"before": "a", "after": "b"},
+            {"before": "b", "after": "c"},
+        ],
+        "max_same_family_run": 2,
+    }
+    resp = post(body)
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "UNSCHEDULABLE"}
+
+
+def test_run_cap_cycle_still_cycle() -> None:
+    body = {
+        "jobs": [
+            {"id": "a", "family": "X"},
+            {"id": "b", "family": "X"},
+            {"id": "c", "family": "X"},
+        ],
+        "edges": [
+            {"before": "a", "after": "b"},
+            {"before": "b", "after": "c"},
+            {"before": "c", "after": "a"},
+        ],
+        "max_same_family_run": 1,
+    }
+    resp = post(body)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "CYCLE"
+    assert data["cycle"] == ["a", "b", "c"]
+
+
+def test_rejects_run_cap_zero() -> None:
+    _expect_422(
+        {
+            "jobs": [
+                {"id": "a", "family": "X"},
+                {"id": "b", "family": "Y"},
+            ],
+            "max_same_family_run": 0,
+        }
+    )
+
+
+def test_rejects_run_cap_negative() -> None:
+    _expect_422(
+        {
+            "jobs": [
+                {"id": "a", "family": "X"},
+                {"id": "b", "family": "Y"},
+            ],
+            "max_same_family_run": -1,
+        }
+    )
+
+
+def test_rejects_run_cap_above_job_limit() -> None:
+    _expect_422(
+        {
+            "jobs": [
+                {"id": "a", "family": "X"},
+                {"id": "b", "family": "Y"},
+            ],
+            "max_same_family_run": 19,
+        }
+    )
+
+
+def test_rejects_run_cap_wrong_types() -> None:
+    base_jobs = [
+        {"id": "a", "family": "X"},
+        {"id": "b", "family": "Y"},
+    ]
+    for bad in [True, "2", 2.0, [2]]:
+        _expect_422({"jobs": base_jobs, "max_same_family_run": bad})

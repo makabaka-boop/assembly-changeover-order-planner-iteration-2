@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pydantic
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 MAX_JOBS = 18
 MIN_JOBS = 2
@@ -61,6 +61,26 @@ class ScheduleRequest(BaseModel):
     jobs: list[JobIn] = Field(..., min_length=MIN_JOBS, max_length=MAX_JOBS)
     edges: list[EdgeIn] = Field(default_factory=list)
     immediate: list[ImmediateIn] = Field(default_factory=list)
+    # When set, no run of consecutive orders sharing one recipe family may be
+    # longer than this value.  ``None`` (or omitted) disables the limit and
+    # keeps the historical response unchanged.  Booleans are rejected on
+    # purpose even though ``bool`` is a subclass of ``int`` in Python.
+    max_same_family_run: int | None = Field(default=None)
+
+    @field_validator("max_same_family_run", mode="before")
+    @classmethod
+    def _validate_run_cap(cls, v: object) -> object:
+        if v is None:
+            return None
+        # Inspect the raw value before pydantic coercion: booleans are ints in
+        # Python, and lax int parsing would accept "2" and 2.0 otherwise.
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise ValueError("max_same_family_run must be an integer")
+        if not (1 <= v <= MAX_JOBS):
+            raise ValueError(
+                f"max_same_family_run must be between 1 and {MAX_JOBS}"
+            )
+        return v
 
     @model_validator(mode="after")
     def _validate(self) -> "ScheduleRequest":
