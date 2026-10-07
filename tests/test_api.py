@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -377,3 +378,167 @@ def test_immediate_pair_does_not_share_duplicate_rule_with_edges() -> None:
     resp = post(body)
     assert resp.status_code == 200
     assert resp.json()["order"] == ["a", "b"]
+
+
+# --------------------------------------------------------------------------
+# max_consecutive_same_family
+# --------------------------------------------------------------------------
+
+
+def test_cap_success_payload() -> None:
+    body = {
+        "jobs": [
+            {"id": "a", "family": "X"},
+            {"id": "b", "family": "X"},
+            {"id": "c", "family": "X"},
+            {"id": "d", "family": "Y"},
+        ],
+        "edges": [],
+        "max_consecutive_same_family": 2,
+    }
+    resp = post(body)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["status"] == "OK"
+    assert data["order"] == ["a", "b", "d", "c"]
+    assert data["changeover_count"] == 2
+    assert data["max_consecutive_same_family"] == 2
+    assert data["family_runs"] == [
+        {
+            "family": "X",
+            "start": 1,
+            "end": 2,
+            "length": 2,
+            "jobs": ["a", "b"],
+        },
+        {
+            "family": "Y",
+            "start": 3,
+            "end": 3,
+            "length": 1,
+            "jobs": ["d"],
+        },
+        {
+            "family": "X",
+            "start": 4,
+            "end": 4,
+            "length": 1,
+            "jobs": ["c"],
+        },
+    ]
+
+
+def test_cap_unschedulable_payload_is_bare() -> None:
+    # All three jobs are X; cap 2 cannot be met by any complete order.
+    body = {
+        "jobs": [
+            {"id": "a", "family": "X"},
+            {"id": "b", "family": "X"},
+            {"id": "c", "family": "X"},
+        ],
+        "max_consecutive_same_family": 2,
+    }
+    resp = post(body)
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "UNSCHEDULABLE"}
+
+
+def test_omitted_and_null_cap_leave_old_payload_identical() -> None:
+    base = {
+        "jobs": [
+            {"id": "a", "family": "X"},
+            {"id": "b", "family": "Y"},
+            {"id": "c", "family": "X"},
+        ],
+        "edges": [{"before": "a", "after": "b"}],
+    }
+    omitted = post(base).json()
+    null = post({**base, "max_consecutive_same_family": None}).json()
+    assert null == omitted
+    assert "family_runs" not in omitted
+    assert "max_consecutive_same_family" not in omitted
+
+
+@pytest.mark.parametrize("bad_value", [0, -1, 19, 100])
+def test_rejects_cap_out_of_range(bad_value: int) -> None:
+    _expect_422(
+        {
+            "jobs": [
+                {"id": "a", "family": "X"},
+                {"id": "b", "family": "Y"},
+            ],
+            "max_consecutive_same_family": bad_value,
+        }
+    )
+
+
+def test_rejects_cap_greater_than_job_count() -> None:
+    # The global schema ceiling is 18, but a cap beyond this request's job
+    # count is also an illegal range.
+    _expect_422(
+        {
+            "jobs": [
+                {"id": "a", "family": "X"},
+                {"id": "b", "family": "Y"},
+            ],
+            "max_consecutive_same_family": 3,
+        }
+    )
+
+
+@pytest.mark.parametrize("bad_value", [1.0, 1.5, True, False, "1", "2", [], {}])
+def test_rejects_cap_wrong_type(bad_value: object) -> None:
+    _expect_422(
+        {
+            "jobs": [
+                {"id": "a", "family": "X"},
+                {"id": "b", "family": "Y"},
+            ],
+            "max_consecutive_same_family": bad_value,
+        }
+    )
+
+
+def test_cap_equals_job_count_is_valid() -> None:
+    body = {
+        "jobs": [
+            {"id": "a", "family": "X"},
+            {"id": "b", "family": "X"},
+        ],
+        "max_consecutive_same_family": 2,
+    }
+    resp = post(body)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["status"] == "OK"
+    assert data["family_runs"] == [
+        {
+            "family": "X",
+            "start": 1,
+            "end": 2,
+            "length": 2,
+            "jobs": ["a", "b"],
+        }
+    ]
+
+
+def test_cap_with_cycle_still_reports_cycle() -> None:
+    body = {
+        "jobs": [
+            {"id": "a", "family": "X"},
+            {"id": "b", "family": "X"},
+            {"id": "c", "family": "X"},
+        ],
+        "edges": [
+            {"before": "a", "after": "b"},
+            {"before": "b", "after": "c"},
+            {"before": "c", "after": "a"},
+        ],
+        "max_consecutive_same_family": 1,
+    }
+    resp = post(body)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "CYCLE"
+    assert data["cycle"] == ["a", "b", "c"]
+    assert set(data) == {"status", "cycle"}

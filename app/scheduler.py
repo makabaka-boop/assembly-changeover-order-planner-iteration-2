@@ -29,6 +29,15 @@ With at most 18 orders there are at most 2**18 * 18 states, stored as a flat
 smallest optimum is then reconstructed greedily: blocks are tried in
 ascending order of their first job id (UTF-8 byte order) and the first one
 that can still attain the DP optimum is chosen.
+
+An optional cap on the length of any consecutive same-family run uses the
+same block contraction but a state that also carries the current run
+length: ``dp(mask, f, r)``.  A chain whose own fixed sequence already
+contains an over-long run is rejected outright, while a violation that only
+appears when two chains touch is detected by the transitions (a uniform
+block extends the current run; a mixed block merges only its head run).
+Both cases are therefore decided together with precedence and adjacency in
+the one DP -- there is no unconstrained solve followed by a repair pass.
 """
 
 from __future__ import annotations
@@ -252,10 +261,279 @@ def _optimal_block_order(
     return order
 
 
+def _optimal_block_order_capped(
+    m: int,
+    chains: list[list[int]],
+    family: list[int],
+    num_families: int,
+    cap: int,
+    first_family: list[int],
+    uniform_family: list[int],
+    prereq_block: list[int],
+) -> list[int] | None:
+    """Like :func:`_optimal_block_order`, but no family may occupy more than
+    *cap* consecutive orders.
+
+    The state therefore has to distinguish not only the last placed block's
+    tail family but also *how long* the current same-family run already is::
+
+        dp(mask, f, r) = minimum remaining changeovers when the blocks in
+                         *mask* are placed, the tail order has family *f*
+                         and the trailing run of family *f* has length *r*.
+
+    Two blocks of family *f* can meet only if their combined run length
+    respects the cap; a block whose own fixed chain already contains a run
+    longer than *cap* is rejected before the DP runs, but a violation that
+    only arises when two chains are concatenated is discovered here -- hence
+    solving the unconstrained optimum first and checking afterwards is
+    impossible.
+
+    Returns the block order, or ``None`` when no complete ordering exists.
+    """
+    # Per-block fixed runs of equal families, e.g. chain X,X,Y -> [(X,2),(Y,1)].
+    block_runs: list[list[tuple[int, int]]] = []
+    for ch in chains:
+        runs: list[tuple[int, int]] = []
+        cur_f = family[ch[0]]
+        run_len = 1
+        for p in range(1, len(ch)):
+            f = family[ch[p]]
+            if f == cur_f:
+                run_len += 1
+            else:
+                runs.append((cur_f, run_len))
+                cur_f = f
+                run_len = 1
+        runs.append((cur_f, run_len))
+        block_runs.append(runs)
+        if max(length for _, length in runs) > cap:
+            # The chain itself violates the cap; no surrounding sequence can
+            # split it because immediate pairs make it indivisible.
+            return None
+
+    # Number of orders of each family bounds the possible run lengths.
+    family_count = [0] * num_families
+    for f in family:
+        family_count[f] += 1
+    fam_limit = [min(cap, c) for c in family_count]
+
+    # Flat slot layout: family f occupies slots
+    # [slot_base[f], slot_base[f] + fam_limit[f]) encoding run length r as
+    # slot_base[f] + (r - 1).  Accessing an impossible state yields INF.
+    slot_base = [0] * num_families
+    total_slots = 0
+    for f in range(num_families):
+        slot_base[f] = total_slots
+        total_slots += fam_limit[f]
+
+    size = 1 << m
+    full = size - 1
+    dp = bytearray([INF]) * (size * total_slots)
+    # Nothing left to place: zero remaining cost from every reachable state.
+    for s in range(total_slots):
+        dp[full * total_slots + s] = 0
+
+    allbits = full
+    # Non-uniform blocks end in a fixed (family, run length) state regardless
+    # of the predecessor run (the head-run merge is only a feasibility test).
+    nonuniform_slot = [0] * m
+    for b in range(m):
+        if uniform_family[b] < 0:
+            tail_f, tail_len = block_runs[b][-1]
+            nonuniform_slot[b] = slot_base[tail_f] + (tail_len - 1)
+
+    # Entry cost = number of changeovers fixed inside the block.
+    entry_cost = [len(runs) - 1 for runs in block_runs]
+
+    for mask in range(full - 1, -1, -1):
+        avail = 0
+        candidates = allbits ^ mask
+        while candidates:
+            lb = candidates & -candidates
+            b = lb.bit_length() - 1
+            if not (prereq_block[b] & ~mask):
+                avail |= lb
+            candidates ^= lb
+        if not avail:
+            continue
+
+        base = mask * total_slots
+        # Per family, the available blocks whose *head* has that family.
+        # The successor-state DP value depends on the predecessor run r:
+        #   * head family != f (one boundary changeover):
+        #       uniform block length L -> state (hf, L)
+        #       non-uniform block     -> its fixed tail state
+        #   * head family == f (no boundary changeover), feasible only when
+        #     the merged head run respects the cap:
+        #       uniform length L       -> state (f, r + L)
+        #       non-uniform head run k -> fixed tail state iff r + k <= cap
+        other_costs: list[list[int]] = [[] for _ in range(num_families)]
+        # (head run length, entry cost, successor dp value at fixed tail)
+        same_nonuniform: list[list[tuple[int, int, int]]] = [
+            [] for _ in range(num_families)
+        ]
+        same_uniform: list[list[int]] = [[] for _ in range(num_families)]
+        candidates = avail
+        while candidates:
+            lb = candidates & -candidates
+            b = lb.bit_length() - 1
+            hf = first_family[b]
+            succ_row = (mask | lb) * total_slots
+            if uniform_family[b] >= 0:
+                length = len(chains[b])
+                nxt = dp[succ_row + slot_base[hf] + (length - 1)]
+                if nxt < INF:
+                    other_costs[hf].append(nxt + 1)
+                    same_uniform[hf].append(b)
+            else:
+                nxt = dp[succ_row + nonuniform_slot[b]]
+                if nxt < INF:
+                    other_costs[hf].append(nxt + entry_cost[b] + 1)
+                    same_nonuniform[hf].append(
+                        (block_runs[b][0][1], entry_cost[b], nxt)
+                    )
+            candidates ^= lb
+
+        # Smallest boundary cost per family, then the best cost coming from
+        # *another* family (the runner-up must have a different head family).
+        m1, m1_f, m2 = INF, -1, INF
+        for f in range(num_families):
+            best = min(other_costs[f], default=INF)
+            if best < m1:
+                m2 = m1
+                m1, m1_f = best, f
+            elif best < m2:
+                m2 = best
+
+        for f in range(num_families):
+            limit = fam_limit[f]
+            if limit == 0:
+                continue
+            sb = slot_base[f]
+            other = m2 if f == m1_f else m1
+            nonun = same_nonuniform[f]
+            uni_blocks = same_uniform[f]
+            for r in range(1, limit + 1):
+                best = other
+                # Non-uniform blocks starting in f: merge test, fixed tail.
+                for head_len, ec, nxt in nonun:
+                    if r + head_len <= cap and nxt + ec < best:
+                        best = nxt + ec
+                # Uniform blocks starting in f: the run extends to r + L.
+                for b in uni_blocks:
+                    new_r = r + len(chains[b])
+                    if new_r <= limit:
+                        nxt = dp[
+                            (mask | (1 << b)) * total_slots + sb + (new_r - 1)
+                        ]
+                        if nxt < best:
+                            best = nxt
+                if best < INF:
+                    dp[base + sb + (r - 1)] = best
+
+    # Greedy reconstruction: blocks are indexed by first-job id byte order,
+    # so ascending indices gives the lexicographically smallest optimum.
+    order: list[int] = []
+    mask = 0
+    tail_f = -1
+    tail_r = 0
+
+    def successor_slot(b: int, preceding_f: int, preceding_r: int) -> int:
+        """Slot of the state produced by appending block *b* after a run
+        (preceding_f, preceding_r); -1 when it would violate the cap."""
+        hf = first_family[b]
+        if uniform_family[b] >= 0:
+            length = len(chains[b])
+            if preceding_f == hf:
+                new_r = preceding_r + length
+                if new_r > fam_limit[hf]:
+                    return -1
+                return slot_base[hf] + (new_r - 1)
+            return slot_base[hf] + (length - 1)
+        if (
+            preceding_f == hf
+            and preceding_r + block_runs[b][0][1] > fam_limit[hf]
+        ):
+            return -1
+        return nonuniform_slot[b]
+
+    while mask != full:
+        avail = 0
+        candidates = allbits ^ mask
+        while candidates:
+            lb = candidates & -candidates
+            b = lb.bit_length() - 1
+            if not (prereq_block[b] & ~mask):
+                avail |= lb
+            candidates ^= lb
+
+        # Evaluate every available block in ascending index order.
+        options: list[tuple[int, int]] = []  # (total cost incl. boundary, b)
+        candidates = avail
+        while candidates:
+            lb = candidates & -candidates
+            b = lb.bit_length() - 1
+            succ_mask = mask | lb
+            if mask == 0:
+                # First block: there is no predecessor run at all, so never
+                # any boundary changeover and never a concatenation check.
+                if uniform_family[b] >= 0:
+                    tail_slot = slot_base[first_family[b]] + (
+                        len(chains[b]) - 1
+                    )
+                else:
+                    tail_slot = nonuniform_slot[b]
+                nxt = dp[succ_mask * total_slots + tail_slot]
+                total = nxt + entry_cost[b] if nxt < INF else INF
+            else:
+                tail_slot = successor_slot(b, tail_f, tail_r)
+                if tail_slot < 0:
+                    total = INF
+                else:
+                    nxt = dp[succ_mask * total_slots + tail_slot]
+                    if nxt >= INF:
+                        total = INF
+                    else:
+                        total = nxt + entry_cost[b] + int(
+                            first_family[b] != tail_f
+                        )
+            if total < INF:
+                options.append((total, b))
+            candidates ^= lb
+
+        if not options:
+            return None
+        best_total = min(t for t, _b in options)
+        # Blocks are indexed by first-job id byte order; candidates were
+        # visited by low-bit order, so options is already in ascending index
+        # order and the first hit gives the lexicographic tie-break.
+        chosen = next(b for t, b in options if t == best_total)
+        order.append(chosen)
+        mask |= 1 << chosen
+        hf = first_family[chosen]
+        if mask.bit_count() == 1 or hf != tail_f:
+            if uniform_family[chosen] >= 0:
+                tail_f = hf
+                tail_r = len(chains[chosen])
+            else:
+                tail_f, tail_r = block_runs[chosen][-1]
+        else:
+            # Same head family, uniform block: the run merges.  A non-uniform
+            # block ending in the same family it starts with resets to its own
+            # tail run length by construction (covered above by block_runs).
+            if uniform_family[chosen] >= 0:
+                tail_r += len(chains[chosen])
+            else:
+                tail_f, tail_r = block_runs[chosen][-1]
+
+    return order
+
+
 def solve(
     jobs: list[Job],
     edges: list[tuple[str, str]],
     immediate: list[tuple[str, str]] | None = None,
+    max_consecutive_same_family: int | None = None,
 ) -> dict:
     """Compute the schedule payload.
 
@@ -266,6 +544,10 @@ def solve(
 
         {"status": "OK", "order": [...], "changeover_count": k,
          "changeover_positions": [...], "changeovers": [...]}
+
+    When *max_consecutive_same_family* is set, the OK payload additionally
+    carries ``max_consecutive_same_family`` (echoed) and ``family_runs`` (the
+    maximal same-family segments of the order for review).
     """
     cycle = find_cycle(jobs, edges)
     if cycle is not None:
@@ -325,6 +607,14 @@ def solve(
 
     first_family = [family[ch[0]] for ch in chains]
     last_family = [family[ch[-1]] for ch in chains]
+    # A block is "uniform" when its whole chain has one family: concatenating
+    # it after another same-family block extends the current run, so the cap
+    # test needs the combined length.  Mixed blocks always start a fresh run
+    # whenever their head family differs, and their internal runs are fixed.
+    uniform_family: list[int] = []
+    for ch in chains:
+        f0 = family[ch[0]]
+        uniform_family.append(f0 if all(family[i] == f0 for i in ch) else -1)
     block_entry_changeovers = [
         sum(
             1 for p in range(1, len(ch)) if family[ch[p]] != family[ch[p - 1]]
@@ -369,21 +659,39 @@ def solve(
     if seen_count != m:
         return {"status": "UNSCHEDULABLE"}
 
-    block_seq = _optimal_block_order(
-        m,
-        first_family,
-        last_family,
-        len(family_names),
-        prereq_block,
-        block_entry_changeovers,
-    )
+    if max_consecutive_same_family is None:
+        block_seq = _optimal_block_order(
+            m,
+            first_family,
+            last_family,
+            len(family_names),
+            prereq_block,
+            block_entry_changeovers,
+        )
+    else:
+        block_seq = _optimal_block_order_capped(
+            m,
+            chains,
+            family,
+            len(family_names),
+            max_consecutive_same_family,
+            first_family,
+            uniform_family,
+            prereq_block,
+        )
+        if block_seq is None:
+            # The constraints are consistent (acyclic, chains intact) but no
+            # complete ordering keeps every same-family run within the cap.
+            return {"status": "UNSCHEDULABLE"}
 
     seq = [i for b in block_seq for i in chains[b]]
 
     order_ids = [ids[i] for i in seq]
     positions: list[int] = []
     details: list[dict] = []
-    prev_f = None
+    family_runs: list[dict] = []
+    run_start = 1
+    prev_f: str | None = None
     for pos, jid in enumerate(order_ids, start=1):
         f = family_of_id[jid]
         if prev_f is not None and f != prev_f:
@@ -395,12 +703,40 @@ def solve(
                     "to": {"id": jid, "family": f},
                 }
             )
+            if max_consecutive_same_family is not None:
+                family_runs.append(
+                    {
+                        "family": prev_f,
+                        "start": run_start,
+                        "end": pos - 1,
+                        "length": pos - run_start,
+                        "jobs": order_ids[run_start - 1 : pos - 1],
+                    }
+                )
+            run_start = pos
         prev_f = f
+    if max_consecutive_same_family is not None:
+        n_ordered = len(order_ids)
+        family_runs.append(
+            {
+                "family": prev_f,
+                "start": run_start,
+                "end": n_ordered,
+                "length": n_ordered - run_start + 1,
+                "jobs": order_ids[run_start - 1 :],
+            }
+        )
 
-    return {
+    payload = {
         "status": "OK",
         "order": order_ids,
         "changeover_count": len(positions),
         "changeover_positions": positions,
         "changeovers": details,
     }
+    if max_consecutive_same_family is not None:
+        # Echo the enforced cap and expose every maximal same-family segment
+        # so the bound can be reviewed against the delivered order.
+        payload["max_consecutive_same_family"] = max_consecutive_same_family
+        payload["family_runs"] = family_runs
+    return payload

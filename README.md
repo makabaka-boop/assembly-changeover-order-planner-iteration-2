@@ -7,6 +7,24 @@
 2. 并列时，按工单 id 的 **UTF-8 字节序**取字典序最小的顺序；
 3. 列出每次换型的 1-based 位置及前后工单。
 
+## 同族连续工单上限（max_consecutive_same_family）
+
+装配线连续处理同一配方族过久会触发工艺限制。请求可**可选地**给出
+`max_consecutive_same_family`（正整数，且不超过本次工单数量；省略或 `null` 表示
+不启用）：任何完整顺序中，同族工单连续出现的段长度都不得超过该上限。
+
+- 类型或范围非法（非整数、`0`/负数、超过 18、超过本次工单数；布尔值、浮点、
+  数字字符串都不会被隐式接受）一律 **422**，整份请求拒绝。
+- 链块内部固定次序本身已超限（某条 `immediate` 链内含超长同族段），或只有在两条
+  链拼接后才超限，都在**同一个子集 DP** 中与普通前置、紧邻链一起裁决——不存在
+  “先生成旧最优顺序、再检查/修补”的步骤；DP 状态为
+  `dp(mask, f, r)`，其中 `f` 是链尾配方族、`r` 是当前同族连续长度。
+- 约束彼此一致但不存在满足上限的完整顺序时返回 **UNSCHEDULABLE**，不返回部分
+  顺序；普通前置图有环时仍保持原 **CYCLE** 语义（环判定优先，证据不变）。
+- 启用上限时，成功响应额外回显 `max_consecutive_same_family`，并给出 `family_runs`
+  （顺序中的每个极大同族连续段：family、1-based `start`/`end`、`length`、`jobs`）
+  以供复核；**未启用时旧输出逐项不变**。
+
 ## 紧邻工单对（immediate）
 
 `immediate` 中每个 `{before, after}` 表示 **after 必须紧跟 before 执行，中间不允许插入
@@ -33,6 +51,19 @@ dp(mask, f) = 已放置 mask 中的链块、最后一个工单 family 为 f 时�
 n ≤ 18，状态数至多 2^18 × 18，以扁平 `bytearray` 存储（最大代价 17，`INF=127`）；
 链块按首工单 id 字节序编号，随后在最优值上按该次序贪心还原，即得唯一的字典序最小
 最优工单序列。
+
+启用同族上限时，状态必须扩展为
+
+```
+dp(mask, f, r) = 已放置 mask 中的链块、链尾 family 为 f、
+                 当前同族连续段长度为 r 时，完成剩余链块所需的最少换型次数
+```
+
+同族块只有在拼接后段长仍不超过上限时才允许放置（uniform 整块延长当前段；混合块
+在段长加其首段长度合法时落到固定的尾态），链内超长在构造块时直接不可行、跨链拼接
+超长在该 DP 的状态转移中不可行——因此“链内已超限”和“仅拼接后超限”在同一次求解
+中被区分处理，不会先产出旧最优再返工。`f` 只保留可达到的 `r`（上界为
+`min(cap, 该族工单数)`）槽位，扁平 `bytearray` 存储。
 
 ## 运行
 
@@ -71,7 +102,8 @@ pytest
   ],
   "immediate": [
     {"before": "a", "after": "b"}
-  ]
+  ],
+  "max_consecutive_same_family": 3
 }
 ```
 
@@ -84,6 +116,8 @@ pytest
   或紧后项（分叉）一律 422。`immediate` 中的自环 `a → a` 不是请求格式错误，但任何
   完整顺序都无法满足，故返回 `UNSCHEDULABLE`；同一对同时出现在 `edges` 与
   `immediate` 中是合法的（二者表达不同强度的要求）。
+- `max_consecutive_same_family` 可省略或为 `null`；给出时必须是 **JSON 整数**
+  （布尔/浮点/字符串均拒绝）且 `1 ≤ 值 ≤ 本次工单数`。
 
 ## 响应
 
@@ -117,14 +151,34 @@ pytest
 }
 ```
 
-普通前置图无环，但紧邻要求与前置关系不可同时满足（200，
-`status=UNSCHEDULABLE`；**不返回任何部分排程**）：
+普通前置图无环，但紧邻要求与前置关系不可同时满足，或启用同族上限后不存在满足全部
+约束的完整顺序（200，`status=UNSCHEDULABLE`；**不返回任何部分排程**）：
 
 ```json
 {
   "status": "UNSCHEDULABLE"
 }
 ```
+
+启用 `max_consecutive_same_family` 时，成功响应在原有字段之外增加：
+
+```json
+{
+  "status": "OK",
+  "order": ["a", "b", "d", "c"],
+  "changeover_count": 2,
+  "changeover_positions": [3, 4],
+  "changeovers": [ "...", "..." ],
+  "max_consecutive_same_family": 2,
+  "family_runs": [
+    {"family": "X", "start": 1, "end": 2, "length": 2, "jobs": ["a", "b"]},
+    {"family": "Y", "start": 3, "end": 3, "length": 1, "jobs": ["d"]},
+    {"family": "X", "start": 4, "end": 4, "length": 1, "jobs": ["c"]}
+  ]
+}
+```
+
+未启用（省略或 `null`）时，响应与旧版逐字段一致（不含上述两个字段）。
 
 ## 测试策略
 
@@ -139,4 +193,11 @@ pytest
   自环、多个环时取最小环、字节序旋转。
 - `tests/test_api.py`：422 校验（自环/重复/未知引用/额外字段/数量与类型，
   以及 immediate 的未知引用/重复/紧前紧后分叉/形状）、CYCLE 与 UNSCHEDULABLE
-  均不含部分排程、省略 `immediate` 与旧请求逐项一致、成功载荷结构。
+  均不含部分排程、省略 `immediate` 与旧请求逐项一致、成功载荷结构；
+  `max_consecutive_same_family` 的类型/范围 422（含 bool/float/字符串、0、超过
+  本次工单数）、`null` 与省略逐项一致、启用时的 `family_runs` 结构。
+- `tests/test_consecutive_cap.py`：对 n≤7 的随机小图（含较长紧邻链、2 族/3 族）
+  穷举所有排列，按定义加上“同族连续段不超过上限”后对拍可行性（OK /
+  UNSCHEDULABLE）、顺序、换型最优值与平局，并逐字段复核 `family_runs`；固定用例
+  覆盖跨链拼接超限、链内段超限（uniform 链与混合链）、cap=1 强制交替、普通前置
+  链迫使超限、块间前置与上限并存、CYCLE 优先级保持，以及 18 工单带上限性能用例。

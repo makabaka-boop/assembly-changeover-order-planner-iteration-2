@@ -61,12 +61,43 @@ class ScheduleRequest(BaseModel):
     jobs: list[JobIn] = Field(..., min_length=MIN_JOBS, max_length=MAX_JOBS)
     edges: list[EdgeIn] = Field(default_factory=list)
     immediate: list[ImmediateIn] = Field(default_factory=list)
+    # Optional cap on how many orders of one recipe family may run back to
+    # back.  ``None`` (omitted or null) disables the limit; an out-of-range
+    # or wrong-typed value rejects the whole request with 422.
+    max_consecutive_same_family: int | None = Field(default=None)
+
+    @pydantic.field_validator("max_consecutive_same_family", mode="before")
+    @classmethod
+    def _validate_consecutive_cap(cls, v: object) -> int | None:
+        if v is None:
+            return None
+        # Pydantic in lax mode would coerce floats such as ``1.0``, bools and
+        # even numeric strings into ints; the field contract is strict: an
+        # actual JSON integer (or null).  ``bool`` is an ``int`` subclass, so
+        # check it first.
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise ValueError("max_consecutive_same_family must be an integer")
+        if v < 1:
+            raise ValueError("max_consecutive_same_family must be at least 1")
+        if v > MAX_JOBS:
+            raise ValueError(
+                f"max_consecutive_same_family must be at most {MAX_JOBS}"
+            )
+        return v
 
     @model_validator(mode="after")
     def _validate(self) -> "ScheduleRequest":
         ids = [j.id for j in self.jobs]
         if len(set(ids)) != len(ids):
             raise ValueError("job ids must be unique")
+
+        # The cap may not exceed the number of orders in this request: such a
+        # value could never bind and is an illegal range for the instance.
+        cap = self.max_consecutive_same_family
+        if cap is not None and cap > len(ids):
+            raise ValueError(
+                "max_consecutive_same_family must not exceed the number of jobs"
+            )
 
         raw_edges = [(e.before, e.after) for e in self.edges]
         if len(raw_edges) > MAX_EDGES:
